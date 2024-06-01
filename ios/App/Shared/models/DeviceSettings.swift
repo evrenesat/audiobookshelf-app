@@ -13,6 +13,7 @@ class DeviceSettings: Object {
     @Persisted var enableAltView: Bool = true
     @Persisted var allowSeekingOnMediaControls: Bool = false
     @Persisted var jumpBackwardsTime: Int = 10
+    @Persisted var volumeLevel: Int = 77
     @Persisted var jumpForwardTime: Int = 10
     @Persisted var lockOrientation: String = "NONE"
     @Persisted var hapticFeedback: String = "LIGHT"
@@ -29,6 +30,7 @@ func deviceSettingsToJSON(settings: DeviceSettings) -> Dictionary<String, Any> {
         "enableAltView": settings.enableAltView,
         "allowSeekingOnMediaControls": settings.allowSeekingOnMediaControls,
         "jumpBackwardsTime": settings.jumpBackwardsTime,
+        "volumeLevel": settings.volumeLevel,
         "jumpForwardTime": settings.jumpForwardTime,
         "lockOrientation": settings.lockOrientation,
         "hapticFeedback": settings.hapticFeedback,

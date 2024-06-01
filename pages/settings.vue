@@ -42,6 +42,13 @@
       </div>
       <p class="pl-4">{{ $strings.LabelDisableAutoRewind }}</p>
     </div>
+
+    <div class="py-3 flex items-center">
+      <p class="pr-4 w-36">{{ $strings.LabelVolumeLevel }}</p>
+      <div>
+        <ui-range-input :min="10" :max="200" :step="5" input-width="180px" v-model="settings.volumeLevel" @input="saveSettings" />
+      </div>
+    </div>
     <div class="flex items-center py-3">
       <div class="w-10 flex justify-center" @click="toggleJumpBackwards">
         <span class="material-icons text-4xl">{{ currentJumpBackwardsTimeIcon }}</span>
@@ -167,6 +174,7 @@ export default {
         disableShakeToResetSleepTimer: false,
         shakeSensitivity: 'MEDIUM',
         lockOrientation: 0,
+        volumeLevel: 88,
         hapticFeedback: 'LIGHT',
         autoSleepTimer: false,
         autoSleepTimerStartTime: '22:00',
@@ -470,7 +478,9 @@ export default {
     },
     async saveSettings() {
       await this.$hapticsImpact()
+      this.settings.volumeLevel = this.settings.volumeLevel ? parseInt(this.settings.volumeLevel) : 96
       const updatedDeviceData = await this.$db.updateDeviceSettings({ ...this.settings })
+      console.log('Updated device data', JSON.stringify(updatedDeviceData))
       if (updatedDeviceData) {
         this.$store.commit('setDeviceData', updatedDeviceData)
         this.deviceData = updatedDeviceData
@@ -482,6 +492,7 @@ export default {
       const deviceSettings = this.deviceData.deviceSettings || {}
       this.settings.disableAutoRewind = !!deviceSettings.disableAutoRewind
       this.settings.enableAltView = !!deviceSettings.enableAltView
+      this.settings.volumeLevel = !isNaN(deviceSettings.volumeLevel) ? deviceSettings.volumeLevel : 99
       this.settings.allowSeekingOnMediaControls = !!deviceSettings.allowSeekingOnMediaControls
       this.settings.jumpForwardTime = deviceSettings.jumpForwardTime || 10
       this.settings.jumpBackwardsTime = deviceSettings.jumpBackwardsTime || 10

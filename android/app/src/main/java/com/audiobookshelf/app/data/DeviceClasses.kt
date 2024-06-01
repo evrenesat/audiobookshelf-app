@@ -117,6 +117,7 @@ data class DeviceSettings(
   var hapticFeedback: HapticFeedbackSetting,
   var autoSleepTimer: Boolean,
   var autoSleepTimerStartTime: String,
+  var volumeLevel: Int,
   var autoSleepTimerEndTime: String,
   var autoSleepTimerAutoRewind: Boolean,
   var autoSleepTimerAutoRewindTime: Long, //Time in milliseconds
@@ -133,6 +134,7 @@ data class DeviceSettings(
         enableAltView = true,
         allowSeekingOnMediaControls = false,
         jumpBackwardsTime = 10,
+        volumeLevel = 55,
         jumpForwardTime = 10,
         enableMp3IndexSeeking = false,
         disableShakeToResetSleepTimer = false,

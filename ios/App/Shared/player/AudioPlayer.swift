@@ -66,6 +66,9 @@ class AudioPlayer: NSObject {
         self.status = .uninitialized
         self.rate = 0.0
         self.tmpRate = playbackRate
+        let deviceSettings = Database.shared.getDeviceSettings()
+        
+        self.audioPlayer.volume = Float(deviceSettings.volumeLevel) / 100.0
         
         super.init()
         
@@ -511,7 +514,8 @@ class AudioPlayer: NSObject {
     
     private func initAudioSession() {
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
         } catch {
             logger.error("Failed to set AVAudioSession category")
             logger.error(error)
