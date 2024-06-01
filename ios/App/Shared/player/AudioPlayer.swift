@@ -29,16 +29,14 @@ class AudioPlayer: NSObject {
     internal let logger = AppLogger(category: "AudioPlayer")
 
     private var status: PlayerStatus
-    internal var rate: Float
+    internal var rateManager: AudioPlayerRateManager
 
-    private var tmpRate: Float = 1.0
-    
     private var playerContext = 0
     private var playerItemContext = 0
-    
+
     internal var playWhenReady: Bool
     private var initialPlaybackRate: Float
-    
+
     internal var audioPlayer: AVQueuePlayer
     private var sessionId: String
 
@@ -46,16 +44,16 @@ class AudioPlayer: NSObject {
     private var sleepTimerObserverToken: Any?
     private var queueObserver:NSKeyValueObservation?
     private var queueItemStatusObserver:NSKeyValueObservation?
-    
+
     // Sleep timer values
     internal var sleepTimeChapterStopAt: Double?
     internal var sleepTimeChapterToken: Any?
     internal var sleepTimer: Timer?
     internal var sleepTimeRemaining: Double?
-    
+
     internal var currentTrackIndex = 0
     private var allPlayerItems:[AVPlayerItem] = []
-    
+
     // MARK: - Constructor
     init(sessionId: String, playWhenReady: Bool = false, playbackRate: Float = 1) {
         self.playWhenReady = playWhenReady
@@ -67,28 +65,36 @@ class AudioPlayer: NSObject {
         self.rate = 0.0
         self.tmpRate = playbackRate
         let deviceSettings = Database.shared.getDeviceSettings()
-        
+
         self.audioPlayer.volume = Float(deviceSettings.volumeLevel) / 100.0
-        
+
+        if #available(iOS 16.0, *) {
+            self.rateManager = DefaultedAudioPlayerRateManager(audioPlayer: self.audioPlayer, defaultRate: playbackRate)
+        } else {
+            self.rateManager = LegacyAudioPlayerRateManager(audioPlayer: self.audioPlayer, defaultRate: playbackRate)
+        }
+
         super.init()
-        
+
+        self.rateManager.rateChangedCompletion = self.updateNowPlaying
+        self.rateManager.defaultRateChangedCompletion = self.setupTimeObservers
+
         initAudioSession()
         setupRemoteTransportControls()
-        
+
         let playbackSession = self.getPlaybackSession()
         guard let playbackSession = playbackSession else {
             logger.error("Failed to fetch playback session. Player will not initialize")
             NotificationCenter.default.post(name: NSNotification.Name(PlayerEvents.failed.rawValue), object: nil)
             return
         }
-        
+
         // Listen to player events
         self.setupAudioSessionNotifications()
-        self.audioPlayer.addObserver(self, forKeyPath: #keyPath(AVPlayer.rate), options: .new, context: &playerContext)
         self.audioPlayer.addObserver(self, forKeyPath: #keyPath(AVPlayer.currentItem), options: .new, context: &playerContext)
-        
+
         for track in playbackSession.audioTracks {
-            
+
             // TODO: All of this to get the ino of the file on the server. Future server release will include the ino with the session tracks
             var audioFileIno = ""
             let trackPath = track.metadata?.path ?? ""
@@ -101,7 +107,7 @@ class AudioPlayer: NSObject {
                 let matchingAudioFile = audioFiles.first(where: { $0.metadata?.path == trackPath })
                 audioFileIno = matchingAudioFile?.ino ?? ""
             }
-            
+
             if let playerAsset = createAsset(itemId: playbackSession.libraryItemId!, track: track, ino: audioFileIno) {
                 let playerItem = AVPlayerItem(asset: playerAsset)
                 if (playbackSession.playMethod == PlayMethod.transcode.rawValue) {
@@ -110,13 +116,13 @@ class AudioPlayer: NSObject {
                 self.allPlayerItems.append(playerItem)
             }
         }
-        
+
         self.currentTrackIndex = getItemIndexForTime(time: playbackSession.currentTime)
         logger.log("Starting track index \(self.currentTrackIndex) for start time \(playbackSession.currentTime)")
-        
+
         let playerItems = self.allPlayerItems[self.currentTrackIndex..<self.allPlayerItems.count]
         logger.log("Setting player items \(playerItems.count)")
-        
+
         for item in Array(playerItems) {
             self.audioPlayer.insert(item, after:self.audioPlayer.items().last)
         }
@@ -127,50 +133,49 @@ class AudioPlayer: NSObject {
 
         logger.log("Audioplayer ready")
     }
-    
+
     deinit {
         self.queueObserver?.invalidate()
         self.queueItemStatusObserver?.invalidate()
     }
-    
+
     public func destroy() {
         // Pause is not synchronous causing this error on below lines:
         // AVAudioSession_iOS.mm:1206  Deactivating an audio session that has running I/O. All I/O should be stopped or paused prior to deactivating the audio session
         // It is related to L79 `AVAudioSession.sharedInstance().setActive(false)`
         self.pause()
         self.audioPlayer.replaceCurrentItem(with: nil)
-        
+
         do {
             try AVAudioSession.sharedInstance().setActive(false)
         } catch {
             logger.error("Failed to set AVAudioSession inactive")
             logger.error(error)
         }
-        
+
         self.removeAudioSessionNotifications()
         DispatchQueue.runOnMainQueue {
             UIApplication.shared.endReceivingRemoteControlEvents()
         }
-        
+
         // Remove observers
-        self.audioPlayer.removeObserver(self, forKeyPath: #keyPath(AVPlayer.rate), context: &playerContext)
         self.audioPlayer.removeObserver(self, forKeyPath: #keyPath(AVPlayer.currentItem), context: &playerContext)
         self.removeTimeObservers()
-        
+
         NotificationCenter.default.post(name: NSNotification.Name(PlayerEvents.closed.rawValue), object: nil)
-        
+
         // Remove timers
         self.removeSleepTimer()
     }
-    
+
     public func isInitialized() -> Bool {
         return self.status != .uninitialized
     }
-    
+
     public func getPlaybackSession() -> PlaybackSession? {
         return Database.shared.getPlaybackSession(id: self.sessionId)
     }
-    
+
     private func getItemIndexForTime(time:Double) -> Int {
         guard let playbackSession = self.getPlaybackSession() else { return 0 }
         for index in 0..<self.allPlayerItems.count {
@@ -186,22 +191,22 @@ class AudioPlayer: NSObject {
         }
         return 0
     }
-    
+
     private func setupAudioSessionNotifications() {
         NotificationCenter.default.addObserver(self, selector: #selector(handleInteruption), name: AVAudioSession.interruptionNotification, object: AVAudioSession.sharedInstance())
         NotificationCenter.default.addObserver(self, selector: #selector(handleRouteChange), name: AVAudioSession.routeChangeNotification, object: AVAudioSession.sharedInstance())
     }
-    
+
     private func removeAudioSessionNotifications() {
         NotificationCenter.default.removeObserver(self, name: AVAudioSession.interruptionNotification, object: AVAudioSession.sharedInstance())
         NotificationCenter.default.removeObserver(self, name: AVAudioSession.routeChangeNotification, object: AVAudioSession.sharedInstance())
     }
-    
+
     private func setupTimeObservers() {
         // Time observer should be configured on the main queue
         DispatchQueue.runOnMainQueue {
             self.removeTimeObservers()
-            
+
             let timeScale = CMTimeScale(NSEC_PER_SEC)
             // Save the current time every 15 seconds
             var seconds = 15.0
@@ -209,10 +214,10 @@ class AudioPlayer: NSObject {
             self.timeObserverToken = self.audioPlayer.addPeriodicTimeObserver(forInterval: time, queue: self.queue) { [weak self] time in
                 guard let self = self else { return }
                 guard self.isInitialized() else { return }
-                
+
                 guard let currentTime = self.getCurrentTime() else { return }
                 let isPlaying = self.isPlaying()
-                
+
                 Task {
                     // Let the player update the current playback positions
                     await PlayerProgress.shared.syncFromPlayer(currentTime: currentTime, includesPlayProgress: isPlaying, isStopping: false)
@@ -232,7 +237,7 @@ class AudioPlayer: NSObject {
             }
         }
     }
-    
+
     private func removeTimeObservers() {
         if let timeObserverToken = timeObserverToken {
             self.audioPlayer.removeTimeObserver(timeObserverToken)
@@ -243,7 +248,7 @@ class AudioPlayer: NSObject {
             self.sleepTimerObserverToken = nil
         }
     }
-    
+
     private func setupQueueObserver() {
         self.queueObserver = self.audioPlayer.observe(\.currentItem, options: [.new]) { [weak self] _,_ in
             guard let self = self else { return }
@@ -256,7 +261,7 @@ class AudioPlayer: NSObject {
             }
         }
     }
-    
+
     private func setupQueueItemStatusObserver() {
         logger.log("queueStatusObserver: Setting up")
 
@@ -265,13 +270,13 @@ class AudioPlayer: NSObject {
         self.queueItemStatusObserver = self.audioPlayer.currentItem?.observe(\.status, options: [.new, .old], changeHandler: { [weak self] playerItem, change in
             self?.handleQueueItemStatus(playerItem: playerItem)
         })
-        
+
         // Ensure we didn't miss a player item update during initialization
         if let playerItem = self.audioPlayer.currentItem {
             self.handleQueueItemStatus(playerItem: playerItem)
         }
     }
-    
+
     private func handleQueueItemStatus(playerItem: AVPlayerItem) {
         logger.log("queueStatusObserver: Current item status changed")
         guard let playbackSession = self.getPlaybackSession() else {
@@ -280,7 +285,7 @@ class AudioPlayer: NSObject {
         }
         if (playerItem.status == .readyToPlay) {
             logger.log("queueStatusObserver: Current Item Ready to play. PlayWhenReady: \(self.playWhenReady)")
-            
+
             // Seek the player before initializing, so a currentTime of 0 does not appear in MediaProgress / session
             let firstReady = self.status == .uninitialized
             if firstReady && !self.playWhenReady {
@@ -288,7 +293,7 @@ class AudioPlayer: NSObject {
                 // Seeking to the correct position happens during play()
                 self.seek(playbackSession.currentTime, from: "queueItemStatusObserver")
             }
-            
+
             // Start the player, if requested
             if self.playWhenReady {
                 self.playWhenReady = false
@@ -302,7 +307,7 @@ class AudioPlayer: NSObject {
             NotificationCenter.default.post(name: NSNotification.Name(PlayerEvents.failed.rawValue), object: nil)
         }
     }
-    
+
     // MARK: - Methods
     public func play(allowSeekBack: Bool = false, isInitializing: Bool = false) {
         guard self.isInitialized() || isInitializing else { return }
@@ -310,17 +315,17 @@ class AudioPlayer: NSObject {
             NotificationCenter.default.post(name: NSNotification.Name(PlayerEvents.failed.rawValue), object: nil)
             return
         }
-        
+
         // Determine where we are starting playback
         let currentTime = allowSeekBack ? PlayerTimeUtils.calcSeekBackTime(currentTime: session.currentTime, lastPlayedMs: session.updatedAt) : session.currentTime
-        
+
         // Sync our new playback position
         Task { await PlayerProgress.shared.syncFromPlayer(currentTime: currentTime, includesPlayProgress: self.isPlaying(), isStopping: false) }
 
         // Start playback, with a seek, for as smooth a scrub bar start as possible
         let currentTrackStartOffset = session.audioTracks[self.currentTrackIndex].startOffset ?? 0.0
         let seekTime = currentTime - currentTrackStartOffset
-        
+
         DispatchQueue.runOnMainQueue {
             self.audioPlayer.seek(to: CMTime(seconds: seekTime, preferredTimescale: 1000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] completed in
                 guard completed else { return }
@@ -328,44 +333,44 @@ class AudioPlayer: NSObject {
             }
         }
     }
-    
+
     private func resumePlayback() {
         logger.log("PLAY: Resuming playback")
-        
+
         self.markAudioSessionAs(active: true)
         DispatchQueue.runOnMainQueue {
             self.audioPlayer.play()
-            self.audioPlayer.rate = self.tmpRate
+            self.rateManager.handlePlayEvent()
         }
         self.status = .playing
 
         // Update the progress
         self.updateNowPlaying()
-        
+
         // Handle a chapter sleep timer that may now be invalid
         self.handleTrackChangeForChapterSleepTimer()
     }
-    
+
     public func pause() {
         guard self.isInitialized() else { return }
-        
+
         logger.log("PAUSE: Pausing playback")
         DispatchQueue.runOnMainQueue {
             self.audioPlayer.pause()
         }
         self.markAudioSessionAs(active: false)
-        
+
         Task {
             if let currentTime = self.getCurrentTime() {
                 await PlayerProgress.shared.syncFromPlayer(currentTime: currentTime, includesPlayProgress: self.isPlaying(), isStopping: true)
             }
         }
-        
-        
+
+
         self.status = .paused
         updateNowPlaying()
     }
-    
+
     public func seek(_ to: Double, from: String) {
         logger.log("SEEK: Seek to \(to) from \(from)")
 
@@ -373,7 +378,7 @@ class AudioPlayer: NSObject {
 
         let indexOfSeek = getItemIndexForTime(time: to)
         logger.log("SEEK: Seek to index \(indexOfSeek) | Current index \(self.currentTrackIndex)")
-        
+
         // Reconstruct queue if seeking to a different track
         if (self.currentTrackIndex != indexOfSeek) {
             // When we seek to a different track, we need to make sure to seek the old track to 0
@@ -381,13 +386,13 @@ class AudioPlayer: NSObject {
             self.audioPlayer.seek(to: CMTime(seconds: 0, preferredTimescale: 1000))
 
             self.currentTrackIndex = indexOfSeek
-            
+
             try? playbackSession.update {
                 playbackSession.currentTime = to
             }
-            
+
             let playerItems = self.allPlayerItems[indexOfSeek..<self.allPlayerItems.count]
-            
+
             DispatchQueue.runOnMainQueue {
                 self.audioPlayer.removeAllItems()
                 for item in Array(playerItems) {
@@ -420,34 +425,17 @@ class AudioPlayer: NSObject {
                         return
                     }
                     guard let self = self else { return }
-                    
+
                     self.updateNowPlaying()
                 }
             }
         }
     }
-    
-    public func setPlaybackRate(_ rate: Float, observed: Bool = false) {
-        let playbackSpeedChanged = rate > 0.0 && rate != self.tmpRate && !(observed && rate == 1)
-        
-        if self.audioPlayer.rate != rate {
-            logger.log("setPlaybakRate rate changed from \(self.audioPlayer.rate) to \(rate)")
-            DispatchQueue.runOnMainQueue {
-                self.audioPlayer.rate = rate
-            }
-        }
-        
-        self.rate = rate
-        self.updateNowPlaying()
-        
-        if playbackSpeedChanged {
-            self.tmpRate = rate
-            
-            // Setup the time observer again at the new rate
-            self.setupTimeObservers()
-        }
+
+    public func setPlaybackRate(_ rate: Float) {
+        self.rateManager.setPlaybackRate(rate)
     }
-    
+
     public func setChapterTrack() {
         self.updateNowPlaying()
     }
@@ -464,20 +452,20 @@ class AudioPlayer: NSObject {
         guard let playbackSession = self.getPlaybackSession() else { return nil }
         return playbackSession.playMethod
     }
-    
+
     public func getPlaybackSessionId() -> String {
         return self.sessionId
     }
-    
+
     public func getDuration() -> Double? {
         guard let playbackSession = self.getPlaybackSession() else { return nil }
         return playbackSession.duration
     }
-    
+
     public func isPlaying() -> Bool {
         return self.status == .playing
     }
-    
+
     public func getPlayerState() -> PlayerState {
         switch status {
         case .uninitialized:
@@ -490,7 +478,7 @@ class AudioPlayer: NSObject {
     // MARK: - Private
     private func createAsset(itemId:String, track:AudioTrack, ino:String) -> AVAsset? {
         guard let playbackSession = self.getPlaybackSession() else { return nil }
-        
+
         if (playbackSession.playMethod == PlayMethod.directplay.rawValue) {
             let urlstr = "\(Store.serverConfig!.address)/api/items/\(itemId)/file/\(ino)?token=\(Store.serverConfig!.token)"
             let url = URL(string: urlstr)!
@@ -511,7 +499,7 @@ class AudioPlayer: NSObject {
             return AVURLAsset(url: URL(string: "\(Store.serverConfig!.address)\(track.contentUrl ?? "")")!, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
         }
     }
-    
+
     private func initAudioSession() {
         do {
             let audioSession = AVAudioSession.sharedInstance()
@@ -521,7 +509,7 @@ class AudioPlayer: NSObject {
             logger.error(error)
         }
     }
-    
+
     private func markAudioSessionAs(active: Bool) {
         do {
             try AVAudioSession.sharedInstance().setActive(active)
@@ -529,7 +517,7 @@ class AudioPlayer: NSObject {
             logger.error("Failed to set audio session as active=\(active)")
         }
     }
-    
+
     // MARK: - iOS audio session notifications
     @objc private func handleInteruption(notification: Notification) {
         guard let userInfo = notification.userInfo,
@@ -537,7 +525,7 @@ class AudioPlayer: NSObject {
             let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
                 return
         }
-        
+
         // When interruption is from the app suspending then don't resume playback
         if #available(iOS 14.5, *) {
             let reasonValue = userInfo[AVAudioSessionInterruptionReasonKey] as? UInt ?? 0
@@ -547,7 +535,7 @@ class AudioPlayer: NSObject {
                 return
             }
         }
-        
+
         switch type {
             case .ended:
                 guard let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt else { return }
@@ -558,14 +546,14 @@ class AudioPlayer: NSObject {
             default: ()
         }
     }
-    
+
     @objc private func handleRouteChange(notification: Notification) {
         guard let userInfo = notification.userInfo,
             let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
             let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue) else {
                 return
         }
-        
+
         switch reason {
         case .newDeviceAvailable: // New device found.
             let session = AVAudioSession.sharedInstance()
@@ -581,16 +569,16 @@ class AudioPlayer: NSObject {
                     self.pause()
                 }
             }
-        
+
         default: ()
         }
     }
-    
+
     private func hasHeadphones(in routeDescription: AVAudioSessionRouteDescription) -> Bool {
         // Filter the outputs to only those with a port type of headphones.
         return !routeDescription.outputs.filter({$0.portType == .headphones}).isEmpty
     }
-    
+
     // MARK: - Now playing
     func setupRemoteTransportControls() {
         DispatchQueue.runOnMainQueue {
@@ -600,8 +588,9 @@ class AudioPlayer: NSObject {
         let deviceSettings = Database.shared.getDeviceSettings()
         let jumpForwardTime = deviceSettings.jumpForwardTime
         let jumpBackwardsTime = deviceSettings.jumpBackwardsTime
-        
+
         commandCenter.playCommand.isEnabled = true
+        commandCenter.playCommand.removeTarget(nil)
         commandCenter.playCommand.addTarget { [weak self] event in
             guard let strongSelf = self else { return .commandFailed }
             if strongSelf.isPlaying() {
@@ -613,6 +602,7 @@ class AudioPlayer: NSObject {
         }
 
         commandCenter.pauseCommand.isEnabled = true
+        commandCenter.pauseCommand.removeTarget(nil)
         commandCenter.pauseCommand.addTarget { [weak self] event in
             guard let strongSelf = self else { return .commandFailed }
             if strongSelf.isPlaying() {
@@ -624,6 +614,7 @@ class AudioPlayer: NSObject {
         }
 
         commandCenter.togglePlayPauseCommand.isEnabled = true
+        commandCenter.togglePlayPauseCommand.removeTarget(nil)
         commandCenter.togglePlayPauseCommand.addTarget { [weak self] event in
             guard let strongSelf = self else { return .commandFailed }
             if strongSelf.isPlaying() {
@@ -633,8 +624,9 @@ class AudioPlayer: NSObject {
             }
             return .success
         }
-        
+
         commandCenter.skipForwardCommand.isEnabled = true
+        commandCenter.skipForwardCommand.removeTarget(nil)
         commandCenter.skipForwardCommand.preferredIntervals = [NSNumber(value: jumpForwardTime)]
         commandCenter.skipForwardCommand.addTarget { [weak self] event in
             guard let command = event.command as? MPSkipIntervalCommand else {
@@ -647,6 +639,7 @@ class AudioPlayer: NSObject {
             return .success
         }
         commandCenter.skipBackwardCommand.isEnabled = true
+        commandCenter.skipBackwardCommand.removeTarget(nil)
         commandCenter.skipBackwardCommand.preferredIntervals = [NSNumber(value: jumpBackwardsTime)]
         commandCenter.skipBackwardCommand.addTarget { [weak self] event in
             guard let command = event.command as? MPSkipIntervalCommand else {
@@ -658,8 +651,9 @@ class AudioPlayer: NSObject {
             self?.seek(currentTime - command.preferredIntervals[0].doubleValue, from: "remote")
             return .success
         }
-        
+
         commandCenter.nextTrackCommand.isEnabled = true
+        commandCenter.nextTrackCommand.removeTarget(nil)
         commandCenter.nextTrackCommand.addTarget { [weak self] _ in
             guard let currentTime = self?.getCurrentTime() else {
                 return .commandFailed
@@ -668,6 +662,7 @@ class AudioPlayer: NSObject {
             return .success
         }
         commandCenter.previousTrackCommand.isEnabled = true
+        commandCenter.previousTrackCommand.removeTarget(nil)
         commandCenter.previousTrackCommand.addTarget { [weak self] _ in
             guard let currentTime = self?.getCurrentTime() else {
                 return .commandFailed
@@ -677,11 +672,12 @@ class AudioPlayer: NSObject {
         }
 
         commandCenter.changePlaybackPositionCommand.isEnabled = deviceSettings.allowSeekingOnMediaControls
+        commandCenter.changePlaybackPositionCommand.removeTarget(nil)
         commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
             guard let event = event as? MPChangePlaybackPositionCommandEvent else {
                 return .noSuchContent
             }
-            
+
             // Adjust seek time if chapter track is being used
             var seekTime = event.positionTime
             if PlayerSettings.main().chapterTrack {
@@ -692,14 +688,15 @@ class AudioPlayer: NSObject {
             self?.seek(seekTime, from: "remote")
             return .success
         }
-        
+
         commandCenter.changePlaybackRateCommand.isEnabled = true
+        commandCenter.changePlaybackRateCommand.removeTarget(nil)
         commandCenter.changePlaybackRateCommand.supportedPlaybackRates = [0.5, 0.75, 1.0, 1.25, 1.5, 2]
         commandCenter.changePlaybackRateCommand.addTarget { [weak self] event in
             guard let event = event as? MPChangePlaybackRateCommandEvent else {
                 return .noSuchContent
             }
-            
+
             self?.setPlaybackRate(event.playbackRate)
             return .success
         }
@@ -710,23 +707,21 @@ class AudioPlayer: NSObject {
             NowPlayingInfo.shared.update(
                 duration: currentChapter.getRelativeChapterEndTime(),
                 currentTime: currentChapter.getRelativeChapterCurrentTime(sessionCurrentTime: session.currentTime),
-                rate: rate,
+                rate: self.rateManager.rate,
+                defaultRate: self.rateManager.defaultRate,
                 chapterName: currentChapter.title,
                 chapterNumber: (session.chapters.firstIndex(of: currentChapter) ?? 0) + 1,
                 chapterCount: session.chapters.count
             )
         } else if let duration = self.getDuration(), let currentTime = self.getCurrentTime() {
-            NowPlayingInfo.shared.update(duration: duration, currentTime: currentTime, rate: rate)
+            NowPlayingInfo.shared.update(duration: duration, currentTime: currentTime, rate: self.rateManager.rate, defaultRate: self.rateManager.defaultRate)
         }
     }
-    
+
     // MARK: - Observer
     public override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
         if context == &playerContext {
-            if keyPath == #keyPath(AVPlayer.rate) {
-                logger.log("playerContext observer player rate")
-                self.setPlaybackRate(change?[.newKey] as? Float ?? 1.0, observed: true)
-            } else if keyPath == #keyPath(AVPlayer.currentItem) {
+            if keyPath == #keyPath(AVPlayer.currentItem) {
                 NotificationCenter.default.post(name: NSNotification.Name(PlayerEvents.update.rawValue), object: nil)
                 logger.log("WARNING: Item ended")
             }
@@ -735,6 +730,6 @@ class AudioPlayer: NSObject {
             return
         }
     }
-    
+
     public static var instance: AudioPlayer?
 }

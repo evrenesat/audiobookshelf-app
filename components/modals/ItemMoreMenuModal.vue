@@ -135,6 +135,14 @@ export default {
         }
       }
 
+      if (this.isConnectedToServer) {
+        items.push({
+          text: this.$strings.ButtonGoToWebClient,
+          value: 'openWebClient',
+          icon: 'language'
+        })
+      }
+
       if (!this.episode) {
         items.push({
           text: this.$strings.LabelMoreInfo,
@@ -285,6 +293,8 @@ export default {
         this.clickRSSFeed()
       } else if (action === 'sendEbook') {
         this.showSendEbookDevicesModal = true
+      } else if (action === 'openWebClient') {
+        this.$store.dispatch('user/openWebClient', `/item/${this.serverLibraryItemId}`)
       }
     },
     async toggleFinished() {
@@ -481,8 +491,8 @@ export default {
       this.$emit('update:processing', true)
       let url = `/api/playlists/${this.playlist.id}/item/${this.serverLibraryItemId}`
       if (this.serverEpisodeId) url += `/${this.serverEpisodeId}`
-      this.$axios
-        .$delete(url)
+      this.$nativeHttp
+        .delete(url)
         .then(() => {
           this.$toast.success('Item removed from playlist')
         })
